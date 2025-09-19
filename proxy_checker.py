@@ -7,6 +7,7 @@ import os
 import requests
 import re
 from urllib.parse import urlparse, parse_qs
+import platform
 
 # Список ссылок с конфигами
 urls = [
@@ -26,6 +27,9 @@ ping_categories = {
 # Папка для временных конфигов
 TMP_DIR = "tmp_configs"
 os.makedirs(TMP_DIR, exist_ok=True)
+
+# Путь к xray.exe для Windows
+XRAY_PATH = r"C:\Users\MAKI\Downloads\Xray-windows-64\xray.exe"
 
 def download_configs():
     configs = []
@@ -135,15 +139,25 @@ async def check_proxy(proxy, idx, protocol):
         
     try:
         start = time.time()
-        process = await asyncio.create_subprocess_exec(
-            "xray", "run", "-config", config_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await asyncio.sleep(2)
-        process.terminate()
-        await process.wait()
         
+        # Запускаем Xray в фоновом режиме
+        process = subprocess.Popen(
+            [XRAY_PATH, "run", "-config", config_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        
+        # Даем Xray немного времени на инициализацию
+        await asyncio.sleep(2)
+        
+        # Принудительно завершаем процесс
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        
+        # Измеряем время выполнения
         ping = int((time.time() - start) * 1000)
         
         if ping <= 300:
@@ -160,10 +174,14 @@ async def check_proxy(proxy, idx, protocol):
         print(f"Ошибка при проверке прокси: {e}")
     finally:
         if os.path.exists(config_path):
-            os.remove(config_path)
+            try:
+                os.remove(config_path)
+            except:
+                pass
 
 async def main():
     proxies = download_configs()
+    print(f"Найдено {len(proxies)} прокси для проверки")
     
     tasks = []
     for idx, proxy in enumerate(proxies):
@@ -182,21 +200,29 @@ async def main():
             except:
                 continue
     
-    await asyncio.gather(*tasks)
+    # Ограничиваем количество одновременных задач
+    batch_size = 10
+    for i in range(0, len(tasks), batch_size):
+        batch = tasks[i:i+batch_size]
+        await asyncio.gather(*batch)
+        print(f"Проверено {min(i+batch_size, len(tasks))} из {len(tasks)} прокси")
     
+    # Сохраняем результаты
     for protocol, categories in ping_categories.items():
         for category, proxies in categories.items():
             if proxies:
                 txt_filename = f"{protocol}_ping_{category}_working_proxies.txt"
                 b64_filename = f"{protocol}_ping_{category}_working_proxies_base64.txt"
                 
-                with open(txt_filename, "w") as txt_file:
+                with open(txt_filename, "w", encoding="utf-8") as txt_file:
                     for proxy in proxies:
                         txt_file.write(proxy + "\n")
                 
-                with open(b64_filename, "w") as b64_file:
+                with open(b64_filename, "w", encoding="utf-8") as b64_file:
                     for proxy in proxies:
                         b64_file.write(base64.b64encode(proxy.encode()).decode() + "\n")
+                
+                print(f"Сохранено {len(proxies)} {protocol} прокси в категории {category}ms")
 
 if __name__ == "__main__":
     asyncio.run(main())
