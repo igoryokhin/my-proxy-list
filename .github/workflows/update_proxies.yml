@@ -25,10 +25,14 @@ jobs:
         wget https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip
         unzip -o Xray-linux-64.zip
         sudo mv xray /usr/local/bin/
+        sudo chmod +x /usr/local/bin/xray
         rm -f Xray-linux-64.zip geoip.dat geosite.dat
 
     - name: Run proxy checker
-      run: python proxy_checker.py
+      run: |
+        # Создаем символьную ссылку для совместимости со скриптом
+        sudo ln -s /usr/local/bin/xray /usr/local/bin/xray.exe
+        python proxy_checker.py
 
     - name: Commit results
       run: |

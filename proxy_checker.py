@@ -28,8 +28,28 @@ ping_categories = {
 TMP_DIR = "tmp_configs"
 os.makedirs(TMP_DIR, exist_ok=True)
 
-# Путь к xray.exe для Windows
-XRAY_PATH = r"C:\Users\MAKI\Downloads\Xray-windows-64\xray.exe"
+# Определяем путь к Xray в зависимости от ОС
+def get_xray_path():
+    if platform.system() == "Windows":
+        # Пути для Windows
+        possible_paths = [
+            r"C:\Users\MAKI\Downloads\Xray-windows-64\xray.exe",
+            r"C:\Program Files\Xray\xray.exe",
+            r"C:\xray\xray.exe",
+            "xray.exe"
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+        
+        # Если ни один путь не найден, возвращаем последний вариант
+        return "xray.exe"
+    else:
+        # Для Linux и других ОС
+        return "xray"
+
+XRAY_PATH = get_xray_path()
 
 def download_configs():
     configs = []
