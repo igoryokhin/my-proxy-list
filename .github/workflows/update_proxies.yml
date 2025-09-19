@@ -23,7 +23,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install requests
         wget https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip
-        unzip Xray-linux-64.zip
+        unzip -o Xray-linux-64.zip  # Добавлен флаг -o для автоматической перезаписи
         sudo mv xray /usr/local/bin/
         rm -f Xray-linux-64.zip geoip.dat geosite.dat
 
