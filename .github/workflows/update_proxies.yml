@@ -1,49 +1,39 @@
-name: Update Proxies
+name: Proxy Checker
 
-# Когда запускать workflow
 on:
+  workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *'  # Ежедневно в полночь UTC
-  workflow_dispatch:       # Позволяет запускать вручную с GitHub
+    - cron: '0 */6 * * *'
 
 jobs:
-  update:
+  check-proxies:
     runs-on: ubuntu-latest
-
+    
     steps:
-      # 1️⃣ Скачиваем репозиторий
-      - name: Checkout repository
-        uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v3
 
-      # 2️⃣ Устанавливаем Python
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
 
-      # 3️⃣ Устанавливаем зависимости
-      - name: Install dependencies
-        run: pip install requests aiofiles
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests
+        wget https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip
+        unzip Xray-linux-64.zip
+        sudo mv xray /usr/local/bin/
+        rm -f Xray-linux-64.zip geoip.dat geosite.dat
 
-      # 4️⃣ Скачиваем и устанавливаем Xray
-      - name: Install Xray
-        run: |
-          wget https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -O xray.zip
-          unzip -o xray.zip
-          chmod +x xray
-          sudo mv xray /usr/local/bin/xray
+    - name: Run proxy checker
+      run: python proxy_checker.py
 
-      # 5️⃣ Запускаем проверку прокси
-      - name: Run proxy checker
-        run: python proxy_checker.py
-
-      # 6️⃣ Коммитим и пушим файлы обратно
-      - name: Commit and push updated files
-        run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "actions@github.com"
-          git add ping_*_working_proxies*.txt
-          git commit -m "Update proxies" || echo "No changes to commit"
-          git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Commit results
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add -A
+        git commit -m "Update proxy lists" || echo "No changes to commit"
+        git push
