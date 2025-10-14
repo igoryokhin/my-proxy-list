@@ -13,7 +13,6 @@ import platform
 import shutil
 import sys
 from typing import Optional, List, Tuple
-from math import ceil
 
 # -------------------- НАСТРОЙКИ --------------------
 urls = [
@@ -246,16 +245,12 @@ def ensure_dir(path: str):
 
 def save_batch_files(protocol: str, category: str, proxies_list: List[str]):
     """
-    Создаёт структуру:
-    results/<protocol>/<category> files and:
-      results/<protocol>/100each/*.txt
-      results/<protocol>/500each/*.txt
-    Также сохраняет объединённый файл в results/<protocol>/
+    Сохранение только в папку results/<protocol>/...
     """
     protocol_dir = os.path.join(RESULTS_DIR, protocol)
     ensure_dir(protocol_dir)
 
-    # Сохраняем объединённый файл в корне папки протокола
+    # Сохраняем объединённый файл в папке протокола
     base_txt = os.path.join(protocol_dir, f"{protocol}_ping_{category}_working_proxies.txt")
     base_b64 = os.path.join(protocol_dir, f"{protocol}_ping_{category}_working_proxies_base64.txt")
     try:
@@ -268,7 +263,7 @@ def save_batch_files(protocol: str, category: str, proxies_list: List[str]):
                     f.write(base64.b64encode(p.encode()).decode() + "\n")
             print(f"[INFO] Saved combined {len(proxies_list)} -> {base_txt}")
         else:
-            # если нет записей — удаляем старые файлы если они есть
+            # удалить старые файлы, если есть
             try:
                 if os.path.exists(base_txt):
                     os.remove(base_txt)
@@ -279,13 +274,13 @@ def save_batch_files(protocol: str, category: str, proxies_list: List[str]):
     except Exception as e:
         print(f"[ERROR] saving combined files for {protocol} {category}: {e}")
 
-    # теперь разбивка на 100 и 500
+    # разбивка на 100 и 500
     for batch_size in (100, 500):
         batch_dir = os.path.join(protocol_dir, f"{batch_size}each")
         ensure_dir(batch_dir)
         parts = chunk_list(proxies_list, batch_size)
+        # очистка старых файлов в папке, если новых частей нет
         if not parts:
-            # удалить старые файлы в этой папке чтобы не мешали
             try:
                 for f in os.listdir(batch_dir):
                     if f.startswith(f"{protocol}_ping_{category}"):
@@ -382,6 +377,27 @@ async def worker(worker_id: int, queue: asyncio.Queue, counter: dict):
             print(f"[INFO] Прогресс: обработано {counter['done']} прокси")
         queue.task_done()
 
+def move_root_result_files_into_results():
+    """
+    Защита: если в корне остались файлы вида <protocol>_ping_..._working_proxies*.txt,
+    перемещаем их в results/<protocol>/
+    """
+    cwd = os.getcwd()
+    for fname in os.listdir(cwd):
+        if not os.path.isfile(fname):
+            continue
+        # простая маска: "<protocol>_ping_"
+        if re.match(r'^(vmess|vless|shadowsocks)_ping_.*_working_proxies.*\.txt$', fname):
+            parts = fname.split('_')
+            protocol = parts[0]
+            dst_dir = os.path.join(RESULTS_DIR, protocol)
+            ensure_dir(dst_dir)
+            try:
+                shutil.move(os.path.join(cwd, fname), os.path.join(dst_dir, fname))
+                print(f"[INFO] Moved root file {fname} -> {dst_dir}")
+            except Exception as e:
+                print(f"[WARN] Could not move {fname}: {e}")
+
 async def main():
     proxies = download_configs()
     print(f"[INFO] Всего получено прокси-строк: {len(proxies)}")
@@ -402,12 +418,14 @@ async def main():
         await q.put(None)
     await asyncio.gather(*workers)
 
-    # Сохраняем результаты с батчингом
+    # Сохраняем результаты в results/<protocol>/...
     for protocol, categories in ping_categories.items():
         for category, proxies_list in categories.items():
             save_batch_files(protocol, category, proxies_list)
 
-    # Краткая сводка
+    # Защитная функция на случай, если какие-то файлы всё же оказались в корне
+    move_root_result_files_into_results()
+
     total_found = sum(len(cat) for proto in ping_categories.values() for cat in proto.values())
     print(f"[INFO] Готово. Найдено рабочих прокси: {total_found}")
 
