@@ -13,15 +13,22 @@ import platform
 import shutil
 import sys
 from typing import Optional, List, Tuple
+from math import ceil
 
 # -------------------- НАСТРОЙКИ --------------------
 urls = [
     "https://raw.githubusercontent.com/roosterkid/openproxylist/refs/heads/main/V2RAY_RAW.txt",
+    "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/ss_configs.txt",
+    "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/vless_configs.txt",
     "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/vmess_configs.txt"
 ]
 
 TMP_DIR = "tmp_configs"
 os.makedirs(TMP_DIR, exist_ok=True)
+
+# Результаты будут сохраняться в results/<protocol>/*
+RESULTS_DIR = "results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # Количество параллельных воркеров (регулируйте)
 CONCURRENT_LIMIT = 10
@@ -83,7 +90,6 @@ def decode_vmess(link: str) -> Optional[dict]:
             return None
         decoded = raw.decode('utf-8', errors='ignore')
         j = json.loads(decoded)
-        # Приведём к виду с outbounds.vnext для удобного извлечения
         if isinstance(j, dict) and "vnext" in j:
             vnext = j["vnext"]
         else:
@@ -96,12 +102,7 @@ def decode_vmess(link: str) -> Optional[dict]:
                     "security": j.get("scy", "auto")
                 }]
             }]
-        return {
-            "outbounds": [{
-                "protocol": "vmess",
-                "settings": {"vnext": vnext}
-            }]
-        }
+        return {"outbounds": [{"protocol": "vmess", "settings": {"vnext": vnext}}]}
     except Exception:
         return None
 
@@ -124,10 +125,7 @@ def decode_vless(link: str) -> Optional[dict]:
                         "users": [{"id": uuid}]
                     }]
                 },
-                "streamSettings": {
-                    "network": network,
-                    "security": security
-                }
+                "streamSettings": {"network": network, "security": security}
             }]
         }
     except Exception:
@@ -137,7 +135,6 @@ def decode_ss(link: str) -> Optional[dict]:
     try:
         raw = link[len("ss://"):].strip()
         raw = raw.split()[0].split('#')[0]
-        # base64 формат или прямой
         if ":" not in raw or ("@" not in raw and re.match(r"^[A-Za-z0-9+/=]+$", raw)):
             decoded = _b64_decode_auto(raw)
             if not decoded:
@@ -158,29 +155,13 @@ def decode_ss(link: str) -> Optional[dict]:
             password = m.group("pw")
             server = m.group("host")
             port = int(m.group("port"))
-        return {
-            "outbounds": [{
-                "protocol": "shadowsocks",
-                "settings": {
-                    "servers": [{
-                        "address": server,
-                        "port": int(port) if port else 0,
-                        "method": method,
-                        "password": password
-                    }]
-                }
-            }]
-        }
+        return {"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": server, "port": int(port) if port else 0, "method": method, "password": password}]}}]}
     except Exception:
         return None
 
 # -------------------- ИЗВЛЕЧЕНИЕ TARGET (HOST:PORT) ИЗ CONFIG --------------------
 def extract_targets_from_config(config: dict) -> List[Tuple[str, int]]:
-    """
-    Ищет адреса и порты в структуре конфига (поддерживает vnext для vmess/vless и servers для shadowsocks).
-    Возвращает список (host, port).
-    """
-    targets = []
+    targets: List[Tuple[str, int]] = []
     try:
         outs = config.get("outbounds", []) if isinstance(config, dict) else []
         for out in outs:
@@ -189,7 +170,6 @@ def extract_targets_from_config(config: dict) -> List[Tuple[str, int]]:
             if proto in ("vmess", "vless"):
                 vnext = settings.get("vnext") or []
                 if isinstance(vnext, dict):
-                    # случай, если vnext не список
                     vnext = [vnext]
                 for vn in vnext:
                     addr = vn.get("address") or vn.get("host")
@@ -210,7 +190,6 @@ def extract_targets_from_config(config: dict) -> List[Tuple[str, int]]:
                         except Exception:
                             pass
             else:
-                # общее: попробовать найти address/port в settings
                 if isinstance(settings, dict):
                     if "servers" in settings and isinstance(settings["servers"], list):
                         for s in settings["servers"]:
@@ -222,7 +201,6 @@ def extract_targets_from_config(config: dict) -> List[Tuple[str, int]]:
                                 except Exception:
                                     pass
                     else:
-                        # прямые поля
                         addr = settings.get("address") or settings.get("host")
                         port = settings.get("port")
                         if addr and port:
@@ -230,9 +208,7 @@ def extract_targets_from_config(config: dict) -> List[Tuple[str, int]]:
                                 targets.append((addr, int(port)))
                             except Exception:
                                 pass
-        # Дополнительные проверки: если targets пусты, попытаемся найти в корне
         if not targets and isinstance(config, dict):
-            # например, config может быть минимальным описанием сервера
             addr = config.get("address") or config.get("host")
             port = config.get("port")
             if addr and port:
@@ -246,18 +222,12 @@ def extract_targets_from_config(config: dict) -> List[Tuple[str, int]]:
 
 # -------------------- TCP PING --------------------
 async def tcp_ping(host: str, port: int, timeout: float) -> Optional[int]:
-    """
-    Пытается установить TCP соединение к host:port.
-    Возвращает RTT в миллисекундах, или None при неудаче.
-    """
     start = time.time()
     try:
         coro = asyncio.open_connection(host, port)
         reader, writer = await asyncio.wait_for(coro, timeout=timeout)
-        # успешно подключились — аккуратно закроем
         try:
             writer.close()
-            # wait_closed может не присутствовать в некоторых реализациях, обернём в try
             if hasattr(writer, "wait_closed"):
                 await writer.wait_closed()
         except Exception:
@@ -267,40 +237,80 @@ async def tcp_ping(host: str, port: int, timeout: float) -> Optional[int]:
     except Exception:
         return None
 
-# -------------------- SAVE UTIL --------------------
-def save_results_to_files():
-    """Сохраняет все категории в файлы."""
-    for protocol, categories in ping_categories.items():
-        for category, proxies_list in categories.items():
-            txt_filename = f"{protocol}_ping_{category}_working_proxies.txt"
-            b64_filename = f"{protocol}_ping_{category}_working_proxies_base64.txt"
+# -------------------- SAVE UTIL ( batching ) --------------------
+def chunk_list(lst: List[str], size: int) -> List[List[str]]:
+    return [lst[i:i+size] for i in range(0, len(lst), size)]
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def save_batch_files(protocol: str, category: str, proxies_list: List[str]):
+    """
+    Создаёт структуру:
+    results/<protocol>/<category> files and:
+      results/<protocol>/100each/*.txt
+      results/<protocol>/500each/*.txt
+    Также сохраняет объединённый файл в results/<protocol>/
+    """
+    protocol_dir = os.path.join(RESULTS_DIR, protocol)
+    ensure_dir(protocol_dir)
+
+    # Сохраняем объединённый файл в корне папки протокола
+    base_txt = os.path.join(protocol_dir, f"{protocol}_ping_{category}_working_proxies.txt")
+    base_b64 = os.path.join(protocol_dir, f"{protocol}_ping_{category}_working_proxies_base64.txt")
+    try:
+        if proxies_list:
+            with open(base_txt, "w", encoding="utf-8") as f:
+                for p in proxies_list:
+                    f.write(p + "\n")
+            with open(base_b64, "w", encoding="utf-8") as f:
+                for p in proxies_list:
+                    f.write(base64.b64encode(p.encode()).decode() + "\n")
+            print(f"[INFO] Saved combined {len(proxies_list)} -> {base_txt}")
+        else:
+            # если нет записей — удаляем старые файлы если они есть
             try:
-                if proxies_list:
-                    with open(txt_filename, "w", encoding="utf-8") as txt_file:
-                        for p in proxies_list:
-                            txt_file.write(p + "\n")
-                    with open(b64_filename, "w", encoding="utf-8") as b64_file:
-                        for p in proxies_list:
-                            b64_file.write(base64.b64encode(p.encode()).decode() + "\n")
-                    print(f"[INFO] Сохранено {len(proxies_list)} {protocol} прокси в категории {category}ms -> {txt_filename}")
-                else:
-                    # Удаляем старые файлы, чтобы не мешали (опционально)
-                    try:
-                        if os.path.exists(txt_filename):
-                            os.remove(txt_filename)
-                        if os.path.exists(b64_filename):
-                            os.remove(b64_filename)
-                    except Exception:
-                        pass
+                if os.path.exists(base_txt):
+                    os.remove(base_txt)
+                if os.path.exists(base_b64):
+                    os.remove(base_b64)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[ERROR] saving combined files for {protocol} {category}: {e}")
+
+    # теперь разбивка на 100 и 500
+    for batch_size in (100, 500):
+        batch_dir = os.path.join(protocol_dir, f"{batch_size}each")
+        ensure_dir(batch_dir)
+        parts = chunk_list(proxies_list, batch_size)
+        if not parts:
+            # удалить старые файлы в этой папке чтобы не мешали
+            try:
+                for f in os.listdir(batch_dir):
+                    if f.startswith(f"{protocol}_ping_{category}"):
+                        os.remove(os.path.join(batch_dir, f))
+            except Exception:
+                pass
+            continue
+
+        total_parts = len(parts)
+        for i, part in enumerate(parts, start=1):
+            txt_filename = os.path.join(batch_dir, f"{protocol}_ping_{category}_part{i}_of_{total_parts}.txt")
+            b64_filename = os.path.join(batch_dir, f"{protocol}_ping_{category}_part{i}_of_{total_parts}_base64.txt")
+            try:
+                with open(txt_filename, "w", encoding="utf-8") as f:
+                    for p in part:
+                        f.write(p + "\n")
+                with open(b64_filename, "w", encoding="utf-8") as f:
+                    for p in part:
+                        f.write(base64.b64encode(p.encode()).decode() + "\n")
+                print(f"[INFO] Saved {len(part)} to {txt_filename}")
             except Exception as e:
-                print(f"[ERROR] Не удалось сохранить файлы для {protocol} {category}: {e}")
+                print(f"[ERROR] saving batch file {txt_filename}: {e}")
 
 # -------------------- ПРОВЕРКА ОДНОГО ПРОКСИ --------------------
 async def check_proxy(proxy_str: str, idx: int, protocol: str):
-    """
-    Декодирует строчку (vmess/vless/ss/JSON), извлекает targets (host:port) и делает tcp_ping.
-    При первом успешном подключении добавляет proxy_str в соответствующую категорию.
-    """
     try:
         config = None
         if protocol == "vmess" and proxy_str.startswith("vmess://"):
@@ -310,13 +320,11 @@ async def check_proxy(proxy_str: str, idx: int, protocol: str):
         elif protocol == "shadowsocks" and proxy_str.startswith("ss://"):
             config = decode_ss(proxy_str)
         else:
-            # возможен уже JSON-конфиг
             try:
                 parsed = json.loads(proxy_str)
                 if isinstance(parsed, dict):
                     config = parsed
             except Exception:
-                # неизвестный формат
                 return
 
         if not config:
@@ -326,11 +334,9 @@ async def check_proxy(proxy_str: str, idx: int, protocol: str):
         if not targets:
             return
 
-        # попытаемся подключиться к каждому target (обычно 1)
         for host, port in targets:
             rtt = await tcp_ping(host, port, timeout=TCP_TIMEOUT)
             if isinstance(rtt, int):
-                # классификация
                 if rtt <= 20:
                     ping_categories[protocol]["0-20"].append(proxy_str)
                 elif rtt <= 50:
@@ -339,11 +345,8 @@ async def check_proxy(proxy_str: str, idx: int, protocol: str):
                     ping_categories[protocol]["51-100"].append(proxy_str)
                 elif rtt <= 300:
                     ping_categories[protocol]["101-300"].append(proxy_str)
-                # при первом успешном target — прекращаем
                 return
-        # если дошли сюда — ни один target не ответил
     except Exception as e:
-        # не ломаем воркеры
         print(f"[ERROR] check_proxy exception idx={idx}: {e}")
 
 # -------------------- WORKER & MAIN --------------------
@@ -395,13 +398,14 @@ async def main():
 
     await q.join()
 
-    # сигнал завершения воркерам
     for _ in workers:
         await q.put(None)
     await asyncio.gather(*workers)
 
-    # Сохраняем результаты
-    save_results_to_files()
+    # Сохраняем результаты с батчингом
+    for protocol, categories in ping_categories.items():
+        for category, proxies_list in categories.items():
+            save_batch_files(protocol, category, proxies_list)
 
     # Краткая сводка
     total_found = sum(len(cat) for proto in ping_categories.values() for cat in proto.values())
