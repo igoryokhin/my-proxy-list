@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
-import subprocess
 import json
 import time
 import base64
@@ -13,22 +12,22 @@ from urllib.parse import urlparse, parse_qs, unquote
 import platform
 import shutil
 import sys
-from typing import Optional
+from typing import Optional, List, Tuple
 
 # -------------------- НАСТРОЙКИ --------------------
-# Список ссылок с конфигами (можно изменить)
 urls = [
     "https://raw.githubusercontent.com/roosterkid/openproxylist/refs/heads/main/V2RAY_RAW.txt",
-    "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/ss_configs.txt",
-    "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/vless_configs.txt",
     "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/vmess_configs.txt"
 ]
 
 TMP_DIR = "tmp_configs"
 os.makedirs(TMP_DIR, exist_ok=True)
 
-# Ограничение параллельности (количество воркеров)
+# Количество параллельных воркеров (регулируйте)
 CONCURRENT_LIMIT = 10
+
+# Таймаут на TCP подключение (в секундах)
+TCP_TIMEOUT = 4.0
 
 # Пинг-категории
 ping_categories = {
@@ -37,57 +36,24 @@ ping_categories = {
     "shadowsocks": {"0-20": [], "21-50": [], "51-100": [], "101-300": []}
 }
 
-# -------------------- ПУТЬ К XRAY --------------------
-def get_xray_path() -> str:
-    # Первым делом — переменная окружения XRAY_PATH
-    env_path = os.environ.get("XRAY_PATH")
-    if env_path:
-        return env_path
-
-    # Проверим в PATH
-    for name in ("xray", "xray.exe"):
-        found = shutil.which(name)
-        if found:
-            return found
-
-    # Windows: потенциальные стандартные места
-    if platform.system() == "Windows":
-        possible_paths = [
-            r"C:\Program Files\Xray\xray.exe",
-            r"C:\xray\xray.exe",
-            r"C:\Users\%USERNAME%\Downloads\Xray-windows-64\xray.exe"
-        ]
-        for p in possible_paths:
-            p_expanded = os.path.expandvars(p)
-            if os.path.exists(p_expanded):
-                return p_expanded
-        return "xray.exe"
-    # Unix: предполагаем что 'xray' в PATH
-    return "xray"
-
-XRAY_PATH = get_xray_path()
-
-# -------------------- ЗАГРУЗКА КОНФИГОВ --------------------
-def download_configs():
+# -------------------- УТИЛИТЫ ЗАГРУЗКИ --------------------
+def download_configs() -> List[str]:
     configs = []
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; proxy-checker/1.0)"
-    })
+    session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; proxy-checker/1.0)"})
     for url in urls:
         try:
-            resp = session.get(url, timeout=15)
+            resp = session.get(url, timeout=20)
             if resp.status_code != 200:
                 print(f"[WARN] {url} -> status {resp.status_code}, пропуск")
                 continue
             lines = [line.strip() for line in resp.text.splitlines() if line.strip()]
-            # Игнорируем комментарии
             lines = [ln for ln in lines if not ln.startswith("#")]
             configs.extend(lines)
             print(f"[INFO] Загружено {len(lines)} строк из {url}")
         except Exception as e:
             print(f"[ERROR] Ошибка при скачивании {url}: {e}")
-    # убираем дубликаты, сохраняем порядок
+    # убираем дубликаты, сохраняя порядок
     seen = set()
     unique = []
     for item in configs:
@@ -96,9 +62,8 @@ def download_configs():
             unique.append(item)
     return unique
 
-# -------------------- ДЕКОДЕРЫ --------------------
+# -------------------- БАЗОВОЕ ДЕКОДИРОВАНИЕ --------------------
 def _b64_decode_auto(s: str) -> Optional[bytes]:
-    """Попытка base64 декодирования с учётом padding."""
     try:
         s = s.strip()
         s = re.sub(r"\s+", "", s)
@@ -117,8 +82,8 @@ def decode_vmess(link: str) -> Optional[dict]:
         if not raw:
             return None
         decoded = raw.decode('utf-8', errors='ignore')
-        j = json.loads(decoded) if decoded.strip().startswith('{') else json.loads(decoded)
-        # Преобразуем в минимально валидный config для xray/v2ray
+        j = json.loads(decoded)
+        # Приведём к виду с outbounds.vnext для удобного извлечения
         if isinstance(j, dict) and "vnext" in j:
             vnext = j["vnext"]
         else:
@@ -132,7 +97,6 @@ def decode_vmess(link: str) -> Optional[dict]:
                 }]
             }]
         return {
-            "log": {"loglevel": "error"},
             "outbounds": [{
                 "protocol": "vmess",
                 "settings": {"vnext": vnext}
@@ -150,8 +114,7 @@ def decode_vless(link: str) -> Optional[dict]:
         params = parse_qs(parsed.query)
         network = params.get('type', ['tcp'])[0]
         security = params.get('security', ['none'])[0]
-        config = {
-            "log": {"loglevel": "error"},
+        return {
             "outbounds": [{
                 "protocol": "vless",
                 "settings": {
@@ -167,7 +130,6 @@ def decode_vless(link: str) -> Optional[dict]:
                 }
             }]
         }
-        return config
     except Exception:
         return None
 
@@ -175,12 +137,12 @@ def decode_ss(link: str) -> Optional[dict]:
     try:
         raw = link[len("ss://"):].strip()
         raw = raw.split()[0].split('#')[0]
+        # base64 формат или прямой
         if ":" not in raw or ("@" not in raw and re.match(r"^[A-Za-z0-9+/=]+$", raw)):
             decoded = _b64_decode_auto(raw)
             if not decoded:
                 return None
-            decoded = decoded.decode('utf-8', errors='ignore')
-            raw = decoded
+            raw = decoded.decode('utf-8', errors='ignore')
         if "@" in raw:
             url_like = "ss://" + raw
             p = urlparse(url_like)
@@ -196,8 +158,7 @@ def decode_ss(link: str) -> Optional[dict]:
             password = m.group("pw")
             server = m.group("host")
             port = int(m.group("port"))
-        config = {
-            "log": {"loglevel": "error"},
+        return {
             "outbounds": [{
                 "protocol": "shadowsocks",
                 "settings": {
@@ -210,117 +171,183 @@ def decode_ss(link: str) -> Optional[dict]:
                 }
             }]
         }
-        return config
     except Exception:
         return None
 
-# -------------------- Утилиты --------------------
-def save_temp_config(config: dict, filename: str) -> Optional[str]:
+# -------------------- ИЗВЛЕЧЕНИЕ TARGET (HOST:PORT) ИЗ CONFIG --------------------
+def extract_targets_from_config(config: dict) -> List[Tuple[str, int]]:
+    """
+    Ищет адреса и порты в структуре конфига (поддерживает vnext для vmess/vless и servers для shadowsocks).
+    Возвращает список (host, port).
+    """
+    targets = []
     try:
-        path = os.path.join(TMP_DIR, filename)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-        return path
-    except Exception as e:
-        print(f"[ERROR] Не удалось сохранить временный конфиг {filename}: {e}")
+        outs = config.get("outbounds", []) if isinstance(config, dict) else []
+        for out in outs:
+            proto = (out.get("protocol") or "").lower()
+            settings = out.get("settings", {}) or {}
+            if proto in ("vmess", "vless"):
+                vnext = settings.get("vnext") or []
+                if isinstance(vnext, dict):
+                    # случай, если vnext не список
+                    vnext = [vnext]
+                for vn in vnext:
+                    addr = vn.get("address") or vn.get("host")
+                    port = vn.get("port")
+                    if addr and port:
+                        try:
+                            targets.append((addr, int(port)))
+                        except Exception:
+                            pass
+            elif proto == "shadowsocks":
+                servers = settings.get("servers", []) or []
+                for s in servers:
+                    addr = s.get("address") or s.get("host")
+                    port = s.get("port")
+                    if addr and port:
+                        try:
+                            targets.append((addr, int(port)))
+                        except Exception:
+                            pass
+            else:
+                # общее: попробовать найти address/port в settings
+                if isinstance(settings, dict):
+                    if "servers" in settings and isinstance(settings["servers"], list):
+                        for s in settings["servers"]:
+                            addr = s.get("address") or s.get("host")
+                            port = s.get("port")
+                            if addr and port:
+                                try:
+                                    targets.append((addr, int(port)))
+                                except Exception:
+                                    pass
+                    else:
+                        # прямые поля
+                        addr = settings.get("address") or settings.get("host")
+                        port = settings.get("port")
+                        if addr and port:
+                            try:
+                                targets.append((addr, int(port)))
+                            except Exception:
+                                pass
+        # Дополнительные проверки: если targets пусты, попытаемся найти в корне
+        if not targets and isinstance(config, dict):
+            # например, config может быть минимальным описанием сервера
+            addr = config.get("address") or config.get("host")
+            port = config.get("port")
+            if addr and port:
+                try:
+                    targets.append((addr, int(port)))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return targets
+
+# -------------------- TCP PING --------------------
+async def tcp_ping(host: str, port: int, timeout: float) -> Optional[int]:
+    """
+    Пытается установить TCP соединение к host:port.
+    Возвращает RTT в миллисекундах, или None при неудаче.
+    """
+    start = time.time()
+    try:
+        coro = asyncio.open_connection(host, port)
+        reader, writer = await asyncio.wait_for(coro, timeout=timeout)
+        # успешно подключились — аккуратно закроем
+        try:
+            writer.close()
+            # wait_closed может не присутствовать в некоторых реализациях, обернём в try
+            if hasattr(writer, "wait_closed"):
+                await writer.wait_closed()
+        except Exception:
+            pass
+        rtt_ms = int((time.time() - start) * 1000)
+        return rtt_ms
+    except Exception:
         return None
 
-# -------------------- ПРОВЕРКА ПРОКСИ --------------------
-async def check_proxy(proxy: str, idx: int, protocol: str):
-    """
-    Выполняет проверку прокси: формирует временный конфиг, запускает xray кратковременно и меряет время.
-    Не использует глобальные семафоры — управление параллельностью осуществляется воркерами.
-    """
-    config = None
-    protocol_key = protocol  # vmess|vless|shadowsocks
-    try:
-        if protocol == "vmess" and proxy.startswith('vmess://'):
-            config = decode_vmess(proxy)
-        elif protocol == "vless" and proxy.startswith('vless://'):
-            config = decode_vless(proxy)
-        elif protocol == "shadowsocks" and proxy.startswith('ss://'):
-            config = decode_ss(proxy)
-        else:
+# -------------------- SAVE UTIL --------------------
+def save_results_to_files():
+    """Сохраняет все категории в файлы."""
+    for protocol, categories in ping_categories.items():
+        for category, proxies_list in categories.items():
+            txt_filename = f"{protocol}_ping_{category}_working_proxies.txt"
+            b64_filename = f"{protocol}_ping_{category}_working_proxies_base64.txt"
             try:
-                parsed = json.loads(proxy)
+                if proxies_list:
+                    with open(txt_filename, "w", encoding="utf-8") as txt_file:
+                        for p in proxies_list:
+                            txt_file.write(p + "\n")
+                    with open(b64_filename, "w", encoding="utf-8") as b64_file:
+                        for p in proxies_list:
+                            b64_file.write(base64.b64encode(p.encode()).decode() + "\n")
+                    print(f"[INFO] Сохранено {len(proxies_list)} {protocol} прокси в категории {category}ms -> {txt_filename}")
+                else:
+                    # Удаляем старые файлы, чтобы не мешали (опционально)
+                    try:
+                        if os.path.exists(txt_filename):
+                            os.remove(txt_filename)
+                        if os.path.exists(b64_filename):
+                            os.remove(b64_filename)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[ERROR] Не удалось сохранить файлы для {protocol} {category}: {e}")
+
+# -------------------- ПРОВЕРКА ОДНОГО ПРОКСИ --------------------
+async def check_proxy(proxy_str: str, idx: int, protocol: str):
+    """
+    Декодирует строчку (vmess/vless/ss/JSON), извлекает targets (host:port) и делает tcp_ping.
+    При первом успешном подключении добавляет proxy_str в соответствующую категорию.
+    """
+    try:
+        config = None
+        if protocol == "vmess" and proxy_str.startswith("vmess://"):
+            config = decode_vmess(proxy_str)
+        elif protocol == "vless" and proxy_str.startswith("vless://"):
+            config = decode_vless(proxy_str)
+        elif protocol == "shadowsocks" and proxy_str.startswith("ss://"):
+            config = decode_ss(proxy_str)
+        else:
+            # возможен уже JSON-конфиг
+            try:
+                parsed = json.loads(proxy_str)
                 if isinstance(parsed, dict):
                     config = parsed
             except Exception:
+                # неизвестный формат
                 return
+
         if not config:
             return
 
-        config_path = save_temp_config(config, f"proxy_{idx}.json")
-        if not config_path:
+        targets = extract_targets_from_config(config)
+        if not targets:
             return
 
-        start = time.time()
-        args = [XRAY_PATH, "run", "-c", config_path]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-        except FileNotFoundError:
-            args = [XRAY_PATH, "-c", config_path]
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *args,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-            except Exception as e:
-                print(f"[ERROR] Не удалось запустить Xray: {e}")
+        # попытаемся подключиться к каждому target (обычно 1)
+        for host, port in targets:
+            rtt = await tcp_ping(host, port, timeout=TCP_TIMEOUT)
+            if isinstance(rtt, int):
+                # классификация
+                if rtt <= 20:
+                    ping_categories[protocol]["0-20"].append(proxy_str)
+                elif rtt <= 50:
+                    ping_categories[protocol]["21-50"].append(proxy_str)
+                elif rtt <= 100:
+                    ping_categories[protocol]["51-100"].append(proxy_str)
+                elif rtt <= 300:
+                    ping_categories[protocol]["101-300"].append(proxy_str)
+                # при первом успешном target — прекращаем
                 return
-        except Exception as e:
-            print(f"[ERROR] Не удалось запустить Xray: {e}")
-            return
-
-        # даём инициализироваться
-        await asyncio.sleep(2)
-
-        # завершаем процесс
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            pass
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
-
-        ping_ms = int((time.time() - start) * 1000)
-
-        if ping_ms <= 300:
-            if ping_ms <= 20:
-                ping_categories[protocol_key]["0-20"].append(proxy)
-            elif ping_ms <= 50:
-                ping_categories[protocol_key]["21-50"].append(proxy)
-            elif ping_ms <= 100:
-                ping_categories[protocol_key]["51-100"].append(proxy)
-            else:
-                ping_categories[protocol_key]["101-300"].append(proxy)
-
+        # если дошли сюда — ни один target не ответил
     except Exception as e:
-        print(f"[ERROR] Ошибка при проверке прокси (idx={idx}): {e}")
-    finally:
-        try:
-            if 'config_path' in locals() and config_path and os.path.exists(config_path):
-                os.remove(config_path)
-        except Exception:
-            pass
+        # не ломаем воркеры
+        print(f"[ERROR] check_proxy exception idx={idx}: {e}")
 
 # -------------------- WORKER & MAIN --------------------
-async def worker(worker_id: int, queue: asyncio.Queue, total_counter: dict):
-    """
-    Воркер извлекает элементы из очереди и вызывает check_proxy.
-    total_counter: словарь {'done': int} для простого счётчика processed элементов.
-    """
+async def worker(worker_id: int, queue: asyncio.Queue, counter: dict):
     while True:
         item = await queue.get()
         if item is None:
@@ -329,30 +356,27 @@ async def worker(worker_id: int, queue: asyncio.Queue, total_counter: dict):
         idx, proxy = item
         lower = proxy.lower() if isinstance(proxy, str) else ""
         protocol = None
-        if lower.startswith('vmess://'):
+        if lower.startswith("vmess://"):
             protocol = "vmess"
-        elif lower.startswith('vless://'):
+        elif lower.startswith("vless://"):
             protocol = "vless"
-        elif lower.startswith('ss://'):
+        elif lower.startswith("ss://"):
             protocol = "shadowsocks"
         else:
             try:
                 parsed = json.loads(proxy)
-                protocol = parsed.get('outbounds', [{}])[0].get('protocol', '')
+                protocol = parsed.get("outbounds", [{}])[0].get("protocol", "")
                 if protocol not in ping_categories:
                     protocol = None
             except Exception:
                 protocol = None
 
         if protocol:
-            try:
-                await check_proxy(proxy, idx, protocol)
-            except Exception as e:
-                print(f"[ERROR] worker {worker_id} exception idx={idx}: {e}")
-        total_counter['done'] += 1
-        # печатаем прогресс каждые 500 обработанных (можно поменять)
-        if total_counter['done'] % 500 == 0:
-            print(f"[INFO] Прогресс: обработано {total_counter['done']} прокси")
+            await check_proxy(proxy, idx, protocol)
+
+        counter['done'] += 1
+        if counter['done'] % 500 == 0:
+            print(f"[INFO] Прогресс: обработано {counter['done']} прокси")
         queue.task_done()
 
 async def main():
@@ -360,46 +384,34 @@ async def main():
     print(f"[INFO] Всего получено прокси-строк: {len(proxies)}")
 
     q = asyncio.Queue()
-    for idx, proxy in enumerate(proxies):
-        await q.put((idx, proxy))
+    for idx, p in enumerate(proxies):
+        await q.put((idx, p))
 
-    # Количество воркеров (не больше CONCURRENT_LIMIT и не больше числа прокси)
     worker_count = min(CONCURRENT_LIMIT, max(1, len(proxies)))
     print(f"[INFO] Запускаем {worker_count} воркеров")
 
-    total_counter = {'done': 0}
-    workers = [asyncio.create_task(worker(i, q, total_counter)) for i in range(worker_count)]
+    counter = {"done": 0}
+    workers = [asyncio.create_task(worker(i, q, counter)) for i in range(worker_count)]
 
-    # Ждём пока очередь опустеет
     await q.join()
 
-    # Посылаем сигнал остановки каждому воркеру
+    # сигнал завершения воркерам
     for _ in workers:
         await q.put(None)
     await asyncio.gather(*workers)
 
-    # Сохраняем результаты в файлы
-    for protocol, categories in ping_categories.items():
-        for category, proxies_list in categories.items():
-            if proxies_list:
-                txt_filename = f"{protocol}_ping_{category}_working_proxies.txt"
-                b64_filename = f"{protocol}_ping_{category}_working_proxies_base64.txt"
-                try:
-                    with open(txt_filename, "w", encoding="utf-8") as txt_file:
-                        for p in proxies_list:
-                            txt_file.write(p + "\n")
-                    with open(b64_filename, "w", encoding="utf-8") as b64_file:
-                        for p in proxies_list:
-                            b64_file.write(base64.b64encode(p.encode()).decode() + "\n")
-                    print(f"[INFO] Сохранено {len(proxies_list)} {protocol} прокси в категории {category}ms -> {txt_filename}")
-                except Exception as e:
-                    print(f"[ERROR] Не удалось сохранить файлы для {protocol} {category}: {e}")
+    # Сохраняем результаты
+    save_results_to_files()
+
+    # Краткая сводка
+    total_found = sum(len(cat) for proto in ping_categories.values() for cat in proto.values())
+    print(f"[INFO] Готово. Найдено рабочих прокси: {total_found}")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[INFO] Прервано пользователем")
+        print("[INFO] Прервано пользователем")
         try:
             sys.exit(0)
         except SystemExit:
