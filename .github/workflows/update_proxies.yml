@@ -57,6 +57,24 @@ jobs:
           sudo ln -sf /usr/local/bin/xray /usr/local/bin/xray.exe
           python -u proxy_checker.py
 
+      - name: Save results snapshot (log)
+        run: |
+          set -euo pipefail
+          echo "=== RESULTS DIR LISTING ==="
+          if [ -d results ]; then
+            find results -type f -maxdepth 4 -print -exec sh -c 'echo "---- head: {} ----"; head -n 30 "{}" || true' \;
+          else
+            echo "No results directory found."
+          fi
+        continue-on-error: true
+
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-archive-${{ github.run_id }}-$(date -u +"%Y%m%dT%H%M%SZ")
+          path: results
+          retention-days: 7
+
       - name: Commit results (safe pull/rebase then push)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
