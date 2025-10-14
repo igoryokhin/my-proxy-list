@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -45,7 +47,6 @@ jobs:
 
           # Очистка временных файлов архива (если есть geosite/geoip — удаляем только из рабочей директории)
           rm -f "${XZIP}" || true
-          # (геодатасеты возможно нужны — удаляйте только если уверены)
           rm -f ./geoip.dat ./geosite.dat || true
 
       - name: Run proxy checker
@@ -53,17 +54,45 @@ jobs:
           XRAY_PATH: /usr/local/bin/xray
         run: |
           set -euo pipefail
-          # Создаем/перезаписываем символьную ссылку для совместимости со скриптом
           sudo ln -sf /usr/local/bin/xray /usr/local/bin/xray.exe
-          # Запускаем скрипт (unbuffered чтобы логи шли сразу)
           python -u proxy_checker.py
 
-      - name: Commit results
+      - name: Commit results (safe pull/rebase then push)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          # Добавляем только файлы результатов, чтобы не закоммитить лишнее
-          git add -- '*_working_proxies*.txt' || echo "No result files to add"
-          git commit -m "Update proxy lists" || echo "No changes to commit"
-          git push
+
+          # Используем token в remote URL, чтобы можно было пушить
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+
+          # Подготовим изменения — добавляем только results
+          git add results || echo "No results to add"
+
+          # Если нет staged изменений — выходим
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "Update proxy lists" || true
+
+          # Попробуем подтянуть последние изменения и сделать rebase.
+          set +e
+          git fetch origin main --quiet
+          git pull --rebase origin main
+          RC=$?
+          set -e
+
+          if [ $RC -ne 0 ]; then
+            echo "Rebase failed (exit $RC). Aborting rebase and skipping push to avoid conflicts."
+            git rebase --abort || true
+            exit 0
+          fi
+
+          # Пушим изменения
+          git push origin HEAD:main
