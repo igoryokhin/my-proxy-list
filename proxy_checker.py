@@ -30,7 +30,7 @@ RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # Количество параллельных воркеров (регулируйте)
-CONCURRENT_LIMIT = 10
+CONCURRENT_LIMIT = 50
 
 # Таймаут на TCP подключение (в секундах)
 TCP_TIMEOUT = 4.0
