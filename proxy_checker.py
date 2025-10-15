@@ -304,15 +304,46 @@ def save_batch_files(protocol: str, category: str, proxies_list: List[str]):
             except Exception as e:
                 print(f"[ERROR] saving batch file {txt_filename}: {e}")
 
+def save_static_subscription_for_protocol(protocol: str, all_proxies: List[str]):
+    """
+    Создаёт статичные файлы для подписки:
+      results/<protocol>/<protocol>_sub.txt
+      results/<protocol>/<protocol>_sub_base64.txt
+    Перезаписывает их каждый запуск — имя статично.
+    """
+    protocol_dir = os.path.join(RESULTS_DIR, protocol)
+    ensure_dir(protocol_dir)
+
+    # Убираем дубликаты, сохраняя порядок
+    seen = set()
+    deduped = []
+    for p in all_proxies:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+
+    sub_txt = os.path.join(protocol_dir, f"{protocol}_sub.txt")
+    sub_b64 = os.path.join(protocol_dir, f"{protocol}_sub_base64.txt")
+    try:
+        with open(sub_txt, "w", encoding="utf-8") as f:
+            for p in deduped:
+                f.write(p + "\n")
+        with open(sub_b64, "w", encoding="utf-8") as f:
+            for p in deduped:
+                f.write(base64.b64encode(p.encode()).decode() + "\n")
+        print(f"[INFO] Saved static subscription files: {sub_txt} ({len(deduped)} entries)")
+    except Exception as e:
+        print(f"[ERROR] saving static subscription for {protocol}: {e}")
+
 # -------------------- ПРОВЕРКА ОДНОГО ПРОКСИ --------------------
 async def check_proxy(proxy_str: str, idx: int, protocol: str):
     try:
         config = None
-        if protocol == "vmess" and proxy_str.startswith("vmess://"):
+        if protocol == "vmess" and proxy_str.startswith('vmess://'):
             config = decode_vmess(proxy_str)
-        elif protocol == "vless" and proxy_str.startswith("vless://"):
+        elif protocol == "vless" and proxy_str.startswith('vless://'):
             config = decode_vless(proxy_str)
-        elif protocol == "shadowsocks" and proxy_str.startswith("ss://"):
+        elif protocol == "shadowsocks" and proxy_str.startswith('ss://'):
             config = decode_ss(proxy_str)
         else:
             try:
@@ -354,16 +385,16 @@ async def worker(worker_id: int, queue: asyncio.Queue, counter: dict):
         idx, proxy = item
         lower = proxy.lower() if isinstance(proxy, str) else ""
         protocol = None
-        if lower.startswith("vmess://"):
+        if lower.startswith('vmess://'):
             protocol = "vmess"
-        elif lower.startswith("vless://"):
+        elif lower.startswith('vless://'):
             protocol = "vless"
-        elif lower.startswith("ss://"):
+        elif lower.startswith('ss://'):
             protocol = "shadowsocks"
         else:
             try:
                 parsed = json.loads(proxy)
-                protocol = parsed.get("outbounds", [{}])[0].get("protocol", "")
+                protocol = parsed.get('outbounds', [{}])[0].get('protocol', '')
                 if protocol not in ping_categories:
                     protocol = None
             except Exception:
@@ -420,8 +451,16 @@ async def main():
 
     # Сохраняем результаты в results/<protocol>/...
     for protocol, categories in ping_categories.items():
+        # по каждой категории сохраняем части/базовые файлы
         for category, proxies_list in categories.items():
             save_batch_files(protocol, category, proxies_list)
+
+        # создаём статичный подпись-файл (sub) содержащий все рабочие прокси для протокола
+        # объединяем категории в порядке от лучшего к худшему
+        combined = []
+        for cat in ("0-20", "21-50", "51-100", "101-300"):
+            combined.extend(ping_categories[protocol].get(cat, []))
+        save_static_subscription_for_protocol(protocol, combined)
 
     # Защитная функция на случай, если какие-то файлы всё же оказались в корне
     move_root_result_files_into_results()
