@@ -64,15 +64,30 @@ jobs:
       - name: Create timestamp for artifact name
         id: ts
         run: |
-          # produce a filesystem-safe UTC timestamp like 20251015T123456Z (no colons, no spaces)
           echo "ts=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
 
-      - name: Upload results artifact
+      - name: Upload results artifact (zip)
+        run: |
+          set -euo pipefail
+          if [ -d results ]; then
+            TS=${{ steps.ts.outputs.ts }}
+            ZIPNAME="results-${{ github.run_id }}-${TS}.zip"
+            zip -r "$ZIPNAME" results > /dev/null || true
+            echo "Created $ZIPNAME"
+            # use upload-artifact action afterwards to upload the zip
+            echo "::set-output name=zip::$ZIPNAME"
+          else
+            echo "No results to zip"
+            echo "::set-output name=zip::"
+          fi
+        id: zipstep
+
+      - name: Upload artifact
+        if: steps.zipstep.outputs.zip != ''
         uses: actions/upload-artifact@v4
         with:
-          # safe artifact name: only alnum, dash, underscore and 'T'/'Z'
           name: results-archive-${{ github.run_id }}-${{ steps.ts.outputs.ts }}
-          path: results
+          path: ${{ steps.zipstep.outputs.zip }}
           retention-days: 7
 
       - name: Merge update branches and Commit results (safe)
