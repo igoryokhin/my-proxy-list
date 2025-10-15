@@ -28,24 +28,17 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install requests
-
-          # Скачиваем конкретный релиз Xray (можно поменять версию)
           XZIP="Xray-linux-64.zip"
           wget -q -O "${XZIP}" "https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip"
           unzip -o "${XZIP}"
-
-          # Ищем бинарник xray в текущей директории/подпапках
           XRAY_BIN=$(find . -maxdepth 3 -type f -name xray -print -quit || true)
           if [ -z "${XRAY_BIN}" ]; then
             echo "xray binary not found after unzip"
             ls -la
             exit 1
           fi
-
           sudo mv "${XRAY_BIN}" /usr/local/bin/xray
           sudo chmod +x /usr/local/bin/xray
-
-          # Очистка временных файлов архива (если есть geosite/geoip — удаляем только из рабочей директории)
           rm -f "${XZIP}" || true
           rm -f ./geoip.dat ./geosite.dat || true
 
@@ -62,55 +55,104 @@ jobs:
           set -euo pipefail
           echo "=== RESULTS DIR LISTING ==="
           if [ -d results ]; then
-            find results -type f -maxdepth 4 -print -exec sh -c 'echo "---- head: {} ----"; head -n 30 "{}" || true' \;
+            find results -type f -maxdepth 5 -print -exec sh -c 'echo "---- head: {} ----"; head -n 30 "{}" || true' \;
           else
             echo "No results directory found."
           fi
         continue-on-error: true
 
+      - name: Create timestamp for artifact name
+        id: ts
+        run: |
+          # produce a filesystem-safe UTC timestamp like 20251015T123456Z (no colons, no spaces)
+          echo "ts=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Upload results artifact
         uses: actions/upload-artifact@v4
         with:
-          name: results-archive-${{ github.run_id }}-$(date -u +"%Y%m%dT%H%M%SZ")
+          # safe artifact name: only alnum, dash, underscore and 'T'/'Z'
+          name: results-archive-${{ github.run_id }}-${{ steps.ts.outputs.ts }}
           path: results
           retention-days: 7
 
-      - name: Commit results (safe pull/rebase then push)
+      - name: Merge update branches and Commit results (safe)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
 
-          # Используем token в remote URL, чтобы можно было пушить
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
 
-          # Подготовим изменения — добавляем только results
-          git add results || echo "No results to add"
+          # Добавляем только results и ru (если есть)
+          git add results ru || true
 
-          # Если нет staged изменений — выходим
           if git diff --cached --quiet; then
-            echo "No changes to commit"
-            exit 0
+            echo "No staged changes to commit right now."
+          else
+            git commit -m "Update proxy lists (workflow)" || true
           fi
 
-          git commit -m "Update proxy lists" || true
+          # Подтянем все update ветки
+          git fetch origin --prune
 
-          # Попробуем подтянуть последние изменения и сделать rebase.
           set +e
-          git fetch origin main --quiet
-          git pull --rebase origin main
-          RC=$?
+          UPDATE_BRANCHES=$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/update/* 2>/dev/null || true)
           set -e
 
-          if [ $RC -ne 0 ]; then
-            echo "Rebase failed (exit $RC). Aborting rebase and skipping push to avoid conflicts."
-            git rebase --abort || true
+          if [ -n "$UPDATE_BRANCHES" ]; then
+            echo "Found update branches:"
+            echo "$UPDATE_BRANCHES"
+          fi
+
+          for remote_ref in $UPDATE_BRANCHES; do
+            branch_name=${remote_ref#origin/}
+            echo ">>> Merging $remote_ref into current branch (main)..."
+
+            set +e
+            git merge --no-edit "$remote_ref"
+            MERGE_RC=$?
+            set -e
+
+            if [ $MERGE_RC -eq 0 ]; then
+              echo "[INFO] Successfully merged $remote_ref"
+              continue
+            fi
+
+            echo "[WARN] Merge conflict with $remote_ref (rc=$MERGE_RC)."
+            echo "[WARN] Extracting ru/results from branch and copying to results/merged_from_${branch_name}."
+
+            tmp_branch="tmp_extract_${branch_name//\//_}_$RANDOM"
+            git checkout -b "$tmp_branch" "$remote_ref"
+
+            if [ -d "ru/results" ]; then
+              dest_dir="results/merged_from_${branch_name//\//_}"
+              mkdir -p "$dest_dir"
+              cp -r ru/results/* "$dest_dir/" || true
+              echo "[INFO] Copied ru/results -> $dest_dir"
+              git checkout main
+              git add "$dest_dir" || true
+              git commit -m "Add merged results from $branch_name (extracted due to conflict)" || true
+            else
+              echo "[INFO] No ru/results in $remote_ref; skipping extraction."
+              git checkout main
+            fi
+
+            git branch -D "$tmp_branch" || true
+          done
+
+          set +e
+          git fetch origin main --quiet
+          git pull --rebase origin main || true
+          set -e
+
+          git add results ru || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit after merging update branches."
             exit 0
           fi
 
-          # Пушим изменения
+          git commit -m "Update proxy lists (merged updates)" || true
           git push origin HEAD:main
