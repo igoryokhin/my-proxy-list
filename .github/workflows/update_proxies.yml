@@ -64,31 +64,64 @@ jobs:
       - name: Create timestamp for artifact name
         id: ts
         run: |
-          echo "ts=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
+          echo "ts=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_ENV"
 
       - name: Upload results artifact (zip)
+        id: zipstep
         run: |
           set -euo pipefail
           if [ -d results ]; then
-            TS=${{ steps.ts.outputs.ts }}
+            TS=${{ env.ts }}
             ZIPNAME="results-${{ github.run_id }}-${TS}.zip"
             zip -r "$ZIPNAME" results > /dev/null || true
+            echo "ZIPNAME=$ZIPNAME" >> "$GITHUB_ENV"
             echo "Created $ZIPNAME"
-            # use upload-artifact action afterwards to upload the zip
-            echo "::set-output name=zip::$ZIPNAME"
           else
+            echo "ZIPNAME=" >> "$GITHUB_ENV"
             echo "No results to zip"
-            echo "::set-output name=zip::"
           fi
-        id: zipstep
 
       - name: Upload artifact
-        if: steps.zipstep.outputs.zip != ''
+        if: env.ZIPNAME != ''
         uses: actions/upload-artifact@v4
         with:
-          name: results-archive-${{ github.run_id }}-${{ steps.ts.outputs.ts }}
-          path: ${{ steps.zipstep.outputs.zip }}
+          name: results-archive-${{ github.run_id }}-${{ env.ts }}
+          path: ${{ env.ZIPNAME }}
           retention-days: 7
+
+      - name: 📦 Commit and push updates for all regions
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git fetch origin --prune --quiet
+
+          TS=${{ env.ts }}
+          REGIONS=("rus" "results" "us" "jp")
+
+          for REGION in "${REGIONS[@]}"; do
+            if [ -d "$REGION" ]; then
+              BRANCH="update/${REGION}-${TS}"
+              echo "[INFO] Processing $REGION -> $BRANCH"
+
+              git checkout -B "$BRANCH" origin/main || git checkout -b "$BRANCH"
+
+              if git diff --quiet -- "$REGION"; then
+                echo "[INFO] No changes in $REGION"
+                continue
+              fi
+
+              git add "$REGION"
+              git commit -m "Local update for $REGION at ${TS}"
+              git push origin "$BRANCH" --force
+              echo "[INFO] Pushed $BRANCH"
+            else
+              echo "[WARN] Folder $REGION not found, skipping."
+            fi
+          done
 
       - name: Merge update branches and Commit results (safe)
         env:
@@ -101,7 +134,6 @@ jobs:
 
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
 
-          # Добавляем только results и ru (если есть)
           git add results ru || true
 
           if git diff --cached --quiet; then
@@ -110,9 +142,7 @@ jobs:
             git commit -m "Update proxy lists (workflow)" || true
           fi
 
-          # Подтянем все update ветки
           git fetch origin --prune
-
           set +e
           UPDATE_BRANCHES=$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/update/* 2>/dev/null || true)
           set -e
