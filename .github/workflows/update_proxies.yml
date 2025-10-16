@@ -14,12 +14,13 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.9'
 
@@ -39,8 +40,7 @@ jobs:
           fi
           sudo mv "${XRAY_BIN}" /usr/local/bin/xray
           sudo chmod +x /usr/local/bin/xray
-          rm -f "${XZIP}" || true
-          rm -f ./geoip.dat ./geosite.dat || true
+          rm -f "${XZIP}" ./geoip.dat ./geosite.dat || true
 
       - name: Run proxy checker
         env:
@@ -61,69 +61,31 @@ jobs:
           fi
         continue-on-error: true
 
-      - name: Create timestamp for artifact name
+      - name: Create timestamp
         id: ts
-        run: |
-          echo "ts=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_ENV"
+        run: echo "ts=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_ENV"
 
-      - name: Upload results artifact (zip)
+      - name: Zip results
         id: zipstep
         run: |
           set -euo pipefail
           if [ -d results ]; then
-            TS=${{ env.ts }}
-            ZIPNAME="results-${{ github.run_id }}-${TS}.zip"
+            ZIPNAME="results-${GITHUB_RUN_ID}-${ts}.zip"
             zip -r "$ZIPNAME" results > /dev/null || true
             echo "ZIPNAME=$ZIPNAME" >> "$GITHUB_ENV"
-            echo "Created $ZIPNAME"
           else
             echo "ZIPNAME=" >> "$GITHUB_ENV"
-            echo "No results to zip"
           fi
 
       - name: Upload artifact
         if: env.ZIPNAME != ''
         uses: actions/upload-artifact@v4
         with:
-          name: results-archive-${{ github.run_id }}-${{ env.ts }}
+          name: results-${{ env.ts }}
           path: ${{ env.ZIPNAME }}
           retention-days: 7
 
-      - name: 📦 Commit and push updates for all regions
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -e
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-          git fetch origin --prune --quiet
-
-          TS=${{ env.ts }}
-          REGIONS=("rus" "results" "us" "jp")
-
-          for REGION in "${REGIONS[@]}"; do
-            if [ -d "$REGION" ]; then
-              BRANCH="update/${REGION}-${TS}"
-              echo "[INFO] Processing $REGION -> $BRANCH"
-
-              git checkout -B "$BRANCH" origin/main || git checkout -b "$BRANCH"
-
-              if git diff --quiet -- "$REGION"; then
-                echo "[INFO] No changes in $REGION"
-                continue
-              fi
-
-              git add "$REGION"
-              git commit -m "Local update for $REGION at ${TS}"
-              git push origin "$BRANCH" --force
-              echo "[INFO] Pushed $BRANCH"
-            else
-              echo "[WARN] Folder $REGION not found, skipping."
-            fi
-          done
-
-      - name: Merge update branches and Commit results (safe)
+      - name: Merge all update branches into main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -131,73 +93,32 @@ jobs:
           set -euo pipefail
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
 
-          git add results ru || true
-
-          if git diff --cached --quiet; then
-            echo "No staged changes to commit right now."
-          else
-            git commit -m "Update proxy lists (workflow)" || true
-          fi
-
           git fetch origin --prune
-          set +e
-          UPDATE_BRANCHES=$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/update/* 2>/dev/null || true)
-          set -e
 
-          if [ -n "$UPDATE_BRANCHES" ]; then
-            echo "Found update branches:"
-            echo "$UPDATE_BRANCHES"
+          echo ">>> Checking update branches..."
+          UPDATE_BRANCHES=$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/update/local-* || true)
+          if [ -z "$UPDATE_BRANCHES" ]; then
+            echo "No update branches found."
+            exit 0
           fi
 
           for remote_ref in $UPDATE_BRANCHES; do
             branch_name=${remote_ref#origin/}
-            echo ">>> Merging $remote_ref into current branch (main)..."
-
-            set +e
-            git merge --no-edit "$remote_ref"
-            MERGE_RC=$?
-            set -e
-
-            if [ $MERGE_RC -eq 0 ]; then
-              echo "[INFO] Successfully merged $remote_ref"
+            echo "Merging $branch_name into main..."
+            git checkout main
+            git merge --no-edit "$remote_ref" || {
+              echo "⚠️ Merge conflict in $branch_name — skipping."
               continue
-            fi
-
-            echo "[WARN] Merge conflict with $remote_ref (rc=$MERGE_RC)."
-            echo "[WARN] Extracting ru/results from branch and copying to results/merged_from_${branch_name}."
-
-            tmp_branch="tmp_extract_${branch_name//\//_}_$RANDOM"
-            git checkout -b "$tmp_branch" "$remote_ref"
-
-            if [ -d "ru/results" ]; then
-              dest_dir="results/merged_from_${branch_name//\//_}"
-              mkdir -p "$dest_dir"
-              cp -r ru/results/* "$dest_dir/" || true
-              echo "[INFO] Copied ru/results -> $dest_dir"
-              git checkout main
-              git add "$dest_dir" || true
-              git commit -m "Add merged results from $branch_name (extracted due to conflict)" || true
-            else
-              echo "[INFO] No ru/results in $remote_ref; skipping extraction."
-              git checkout main
-            fi
-
-            git branch -D "$tmp_branch" || true
+            }
           done
-
-          set +e
-          git fetch origin main --quiet
-          git pull --rebase origin main || true
-          set -e
 
           git add results ru || true
           if git diff --cached --quiet; then
-            echo "No changes to commit after merging update branches."
+            echo "No changes to commit."
             exit 0
           fi
 
-          git commit -m "Update proxy lists (merged updates)" || true
+          git commit -m "Auto-merge proxy updates ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
           git push origin HEAD:main
