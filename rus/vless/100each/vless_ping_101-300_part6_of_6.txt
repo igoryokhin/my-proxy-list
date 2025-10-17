@@ -1,0 +1,1 @@
+vless://sGLzG6kUwBpZd73sW0nq@129.146.132.124:1500?mode=gun&security=reality&encryption=none&pbk=VQxVgczORkbSNdDrkNOYs6zMBINpViztTKDuWCeQsVE&fp=chrome&type=grpc&sni=🔒 [By EbraSha]&sid=775eb6408888248e # 🔒 [By EbraSha]
